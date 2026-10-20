@@ -146,7 +146,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            '${novel.durationMinutes} мин',
+                            '${novel.durationMinutes} min',
                             style: const TextStyle(
                               color: Colors.white38,
                               fontSize: 12,
@@ -176,29 +176,22 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                 ),
                               ),
                               onPressed: () {
-                                if (novel.isPremium) {
-                                  // Заглушка под будущую интеграцию оплаты/Бусти
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(
-                                      content: Text(
-                                        'Вход доступен только для членов Клуба Vael.',
-                                      ),
+                                // Для платных новелл первая глава бесплатная:
+                                // дальше ReaderScreen сам проверит покупку/подписку
+                                // и покажет paywall после её дочитывания.
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (context) => ReaderScreen(
+                                      novelUrl: novel.novelUrl,
+                                      title: novel.title,
+                                      novelId: novel.id,
+                                      isPremium: novel.isPremium,
                                     ),
-                                  );
-                                } else {
-                                  // Открываем fullscreen чтение
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (context) => ReaderScreen(
-                                        novelUrl: novel.novelUrl,
-                                        title: novel.title,
-                                      ),
-                                    ),
-                                  );
-                                }
+                                  ),
+                                );
                               },
-                              child: Text(
-                                novel.isPremium ? 'Открыть доступ' : 'Читать',
+                              child: const Text(
+                                'Read',
                               ),
                             ),
                           ),
