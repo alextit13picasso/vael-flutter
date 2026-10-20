@@ -70,7 +70,7 @@ class _PaywallSheetState extends State<_PaywallSheet> {
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('Payment failed. Please try again later.'),
+        content: Text('Purchase was not completed. Please try again.'),
       ),
     );
   }

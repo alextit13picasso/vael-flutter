@@ -1,4 +1,10 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vael/services/in_app_purchase_gateway.dart';
+import 'package:vael/services/purchase_gateway.dart';
 
 /// Статус доступа пользователя к новелле.
 enum AccessStatus {
@@ -12,7 +18,7 @@ enum AccessStatus {
   requiresPurchase,
 }
 
-/// Покупка новеллы. Пока просто entity-заглушка под будущую библиотеку покупок.
+/// Покупка новеллы.
 class NovelPurchase {
   final String novelId;
   final DateTime purchasedAt;
@@ -23,7 +29,7 @@ class NovelPurchase {
   });
 }
 
-/// Подписка Vael Club. Пока просто entity-заглушка под будущую библиотеку подписок.
+/// Подписка Vael Club.
 class VaelSubscription {
   final String planId;
   final DateTime startedAt;
@@ -42,22 +48,56 @@ class VaelSubscription {
   }
 }
 
-/// Сервис проверки прав доступа к платному контенту.
+/// Права доступа пользователя к платному контенту.
 ///
-/// Сейчас это **заглушка**: реальные покупки и подписки ещё не подключены.
-/// Когда будет выбрана библиотека (in_app_purchase / RevenueCat и т.п.),
-/// достаточно будет заменить тела [purchaseNovel], [subscribeToClub] и
-/// [fetchActiveSubscription] — остальной код приложения менять не придётся.
+/// Работает поверх [PurchaseGateway] (сейчас — официальный `in_app_purchase`,
+/// то есть Google Play Billing и StoreKit). Всё, что делает сервис:
+/// * проверяет доступ к новелле;
+/// * запускает покупку/подписку и раздаёт права по событиям стора;
+/// * кэширует права локально, чтобы paywall не появлялся повторно офлайн.
+///
+/// Что осталось на потом (когда приложение попадёт в сторы):
+/// * проверка чеков на бэкенде (Play Developer API / App Store Server API);
+/// * реальная дата окончания подписки — сейчас ставится «+31 день».
 class EntitlementService {
   EntitlementService._();
 
   static final EntitlementService instance = EntitlementService._();
 
-  /// Купленные новеллы (in-memory заглушка вместо локальной БД/сервера).
-  final Set<String> _purchasedNovelIds = <String>{};
+  /// ID подписки в Google Play Console / App Store Connect.
+  static const String subscriptionProductId = 'vael_club_monthly';
 
-  /// Текущая подписка (если есть).
+  /// ID разовой покупки новеллы: `novel_<id из каталога>`.
+  static String novelProductIdFor(String novelId) => 'novel_$novelId';
+
+  /// Пока стор не настроен (приложение не опубликовано, товары не созданы),
+  /// в debug-сборке эмулируем успешную оплату — иначе флоу не проверить.
+  /// В release-сборке заглушка выключена и покупка честно падает.
+  static const bool allowStubWhenStoreUnavailable = kDebugMode;
+
+  static const String _novelsKey = 'vael.entitlements.novels';
+  static const String _subscriptionKey = 'vael.entitlements.subscription';
+
+  PurchaseGateway _gateway = InAppPurchaseGateway();
+  StreamSubscription<PurchaseEvent>? _eventsSubscription;
+  final Map<String, Completer<bool>> _pendingPurchases = {};
+
+  final Set<String> _purchasedNovelIds = <String>{};
   VaelSubscription? _subscription;
+  bool _initialized = false;
+
+  /// Вызывается один раз на старте приложения — до `runApp`.
+  ///
+  /// Подписка на поток покупок ставится здесь, чтобы не потерять события,
+  /// которые стор присылает сразу после запуска.
+  Future<void> initialize() async {
+    if (_initialized) return;
+    _initialized = true;
+
+    await _loadPersisted();
+    await _gateway.initialize();
+    _eventsSubscription = _gateway.events.listen(_onPurchaseEvent);
+  }
 
   /// Главная точка входа: можно ли читать новеллу дальше.
   ///
@@ -82,74 +122,223 @@ class EntitlementService {
 
   /// Возвращает активную подписку или `null`, если её нет.
   Future<VaelSubscription?> fetchActiveSubscription() async {
-    // TODO(subscriptions): подтянуть реальный статус из библиотеки подписок.
     final subscription = _subscription;
     if (subscription == null || !subscription.isActive) return null;
     return subscription;
   }
 
-  /// Пока реальная оплата не подключена, стаб-покупка сразу выдаёт доступ —
-  /// так можно проверять флоу «купил → чтение продолжается со 2-й главы».
-  /// Поставьте `false`, чтобы увидеть ветку неудачной оплаты.
-  static const bool stubPurchasesSucceed = true;
-
-  /// Покупка конкретной новеллы.
-  ///
-  /// `true` — покупка прошла успешно и доступ выдан.
+  /// Покупка конкретной новеллы. `true` — доступ выдан.
   Future<bool> purchaseNovel(String novelId) async {
-    // TODO(purchases): здесь будет вызов библиотеки покупок.
-    await Future<void>.delayed(const Duration(milliseconds: 600));
-    if (!stubPurchasesSucceed) return false;
-
-    _purchasedNovelIds.add(novelId);
-    debugPrint('EntitlementService: СТАБ-покупка "$novelId" — доступ выдан');
-    return true;
+    if (novelId.isEmpty) return false;
+    if (_purchasedNovelIds.contains(novelId)) return true;
+    return _purchaseProduct(novelProductIdFor(novelId));
   }
 
-  /// Оформление подписки Vael Club.
-  ///
-  /// `true` — подписка оформлена и доступ выдан.
+  /// Оформление подписки Vael Club. `true` — доступ выдан.
   Future<bool> subscribeToClub() async {
-    // TODO(subscriptions): здесь будет вызов библиотеки подписок.
-    await Future<void>.delayed(const Duration(milliseconds: 600));
-    if (!stubPurchasesSucceed) return false;
+    if (_subscription?.isActive == true) return true;
+    return _purchaseProduct(subscriptionProductId);
+  }
 
-    final now = DateTime.now();
-    _subscription = VaelSubscription(
-      planId: 'stub_monthly',
-      startedAt: now,
-      expiresAt: now.add(const Duration(days: 30)),
-    );
-    debugPrint('EntitlementService: СТАБ-подписка оформлена — доступ выдан');
-    return true;
+  /// Восстановление покупок (кнопка "Restore purchases").
+  /// Результат прилетит через поток событий стора.
+  Future<void> restorePurchases() => _gateway.restorePurchases();
+
+  /// Доступные товары — для показа реальных цен на paywall.
+  Future<StoreProduct?> loadSubscriptionProduct() =>
+      _gateway.loadProduct(subscriptionProductId);
+
+  Future<StoreProduct?> loadNovelProduct(String novelId) =>
+      _gateway.loadProduct(novelProductIdFor(novelId));
+
+  // ---------------------------------------------------------------------------
+  // Покупка
+  // ---------------------------------------------------------------------------
+
+  Future<bool> _purchaseProduct(String productId) async {
+    final product = await _gateway.loadProduct(productId);
+
+    // Товара нет: приложение не опубликовано или товар не создан в консоли.
+    if (product == null) {
+      if (allowStubWhenStoreUnavailable) {
+        debugPrint(
+          'EntitlementService: СТАБ-покупка "$productId" — товар не найден '
+          'в сторе, debug-сборка выдаёт доступ. '
+          'Создайте товар в Google Play Console / App Store Connect.',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+        await _grant(productId);
+        return true;
+      }
+
+      debugPrint('EntitlementService: товар "$productId" недоступен в сторе');
+      return false;
+    }
+
+    final completer = Completer<bool>();
+    _pendingPurchases[productId] = completer;
+
+    final started = await _gateway.buy(productId);
+    if (!started) {
+      _pendingPurchases.remove(productId);
+      return false;
+    }
+
+    try {
+      return await completer.future.timeout(
+        const Duration(minutes: 5),
+        onTimeout: () {
+          debugPrint('EntitlementService: покупка "$productId" не завершилась');
+          return false;
+        },
+      );
+    } finally {
+      _pendingPurchases.remove(productId);
+    }
+  }
+
+  Future<void> _onPurchaseEvent(PurchaseEvent event) async {
+    debugPrint('EntitlementService: стор → $event');
+
+    switch (event.type) {
+      case PurchaseEventType.purchased:
+      case PurchaseEventType.restored:
+        await _grant(event.productId);
+        _resolvePending(event.productId, granted: true);
+        break;
+      case PurchaseEventType.canceled:
+      case PurchaseEventType.failed:
+        _resolvePending(event.productId, granted: false);
+        break;
+      case PurchaseEventType.pending:
+        break;
+    }
+  }
+
+  void _resolvePending(String productId, {required bool granted}) {
+    final completer = _pendingPurchases[productId];
+    if (completer == null || completer.isCompleted) return;
+    completer.complete(granted);
+  }
+
+  /// Выдаёт права по ID товара и сохраняет их локально.
+  Future<void> _grant(String productId) async {
+    if (productId.isEmpty) return;
+
+    if (productId == subscriptionProductId) {
+      if (_subscription?.isActive == true) return;
+      final now = DateTime.now();
+      _subscription = VaelSubscription(
+        planId: productId,
+        startedAt: now,
+        // TODO(purchases): реальную дату продления даёт проверка чека
+        // (Play Developer API / App Store Server API). Клиент её не знает.
+        expiresAt: now.add(const Duration(days: 31)),
+      );
+      await _persist();
+      return;
+    }
+
+    final novelId = _novelIdFromProductId(productId);
+    if (novelId == null) return;
+    if (!_purchasedNovelIds.add(novelId)) return;
+
+    await _persist();
+  }
+
+  /// `novel_brought_coffee_01` → `brought_coffee_01`.
+  static String? _novelIdFromProductId(String productId) {
+    const prefix = 'novel_';
+    if (!productId.startsWith(prefix)) return null;
+    final novelId = productId.substring(prefix.length);
+    return novelId.isEmpty ? null : novelId;
   }
 
   // ---------------------------------------------------------------------------
-  // Отладочные методы — позволяют проверить ветку "доступ есть" без оплаты.
+  // Локальный кэш прав
   // ---------------------------------------------------------------------------
+
+  Future<void> _loadPersisted() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      _purchasedNovelIds.addAll(prefs.getStringList(_novelsKey) ?? const []);
+
+      final rawSubscription = prefs.getString(_subscriptionKey);
+      if (rawSubscription != null) {
+        final json = jsonDecode(rawSubscription) as Map<String, dynamic>;
+        _subscription = VaelSubscription(
+          planId: json['planId'] as String? ?? subscriptionProductId,
+          startedAt: DateTime.tryParse(json['startedAt'] as String? ?? '') ??
+              DateTime.now(),
+          expiresAt: DateTime.tryParse(json['expiresAt'] as String? ?? ''),
+        );
+      }
+    } catch (e) {
+      debugPrint('EntitlementService: не удалось прочитать покупки: $e');
+    }
+  }
+
+  Future<void> _persist() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_novelsKey, _purchasedNovelIds.toList());
+
+      final subscription = _subscription;
+      if (subscription == null) {
+        await prefs.remove(_subscriptionKey);
+      } else {
+        await prefs.setString(
+          _subscriptionKey,
+          jsonEncode({
+            'planId': subscription.planId,
+            'startedAt': subscription.startedAt.toIso8601String(),
+            'expiresAt': subscription.expiresAt?.toIso8601String(),
+          }),
+        );
+      }
+    } catch (e) {
+      debugPrint('EntitlementService: не удалось сохранить покупки: $e');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Отладка и тесты
+  // ---------------------------------------------------------------------------
+
+  /// Подменяет шлюз (для тестов).
+  @visibleForTesting
+  void useGateway(PurchaseGateway gateway) {
+    _eventsSubscription?.cancel();
+    _gateway = gateway;
+    _initialized = false;
+  }
 
   /// Эмулирует успешную покупку новеллы.
   @visibleForTesting
-  void debugGrantNovel(String novelId) {
-    _purchasedNovelIds.add(novelId);
-  }
+  Future<void> debugGrantNovel(String novelId) =>
+      _grant(novelProductIdFor(novelId));
 
   /// Эмулирует активную подписку.
   @visibleForTesting
-  void debugGrantSubscription({Duration duration = const Duration(days: 30)}) {
+  Future<void> debugGrantSubscription({
+    Duration duration = const Duration(days: 31),
+  }) async {
     final now = DateTime.now();
     _subscription = VaelSubscription(
-      planId: 'debug',
+      planId: subscriptionProductId,
       startedAt: now,
       expiresAt: now.add(duration),
     );
+    await _persist();
   }
 
-  /// Сбрасывает все эмуляции и отзывает доступ.
+  /// Сбрасывает все покупки и подписку.
   @visibleForTesting
-  void debugReset() {
+  Future<void> debugReset() async {
     _purchasedNovelIds.clear();
     _subscription = null;
+    await _persist();
   }
 
   /// Купленные новеллы (только для отладки/тестов).

@@ -2,6 +2,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Google Play Billing (in_app_purchase) -->
+    <uses-permission android:name="com.android.vending.BILLING" />
+
     <application
         android:label="vael"
         android:name="${applicationName}"
